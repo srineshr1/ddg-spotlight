@@ -1,96 +1,121 @@
 # ddg-spotlight
 
-A macOS-Spotlight-style **web search launcher for the terminal**, built for
-Omarchy / Hyprland. Hit a keybind, a small floating box appears in the centre of
-your screen, you type, and you get live DuckDuckGo instant answers — press
-`Enter` to open the full results (or a selected topic) in your browser.
+A macOS-Spotlight-style **search launcher for the terminal**, built for
+Omarchy / Hyprland. Hit a keybind and a small bordered search bar appears,
+floating over your normal (un-dimmed, un-blurred) desktop. It has **three modes**,
+chosen by a leading sigil:
+
+- **(nothing)** — **web search** via DuckDuckGo: live suggestions as you type,
+  then `Enter` grows the card into an instant answer + a Google-style ranked
+  list of web links.
+- **`@`** — **file search**: blazing-fast fuzzy search of files under your home.
+- **`/`** — **folder search**: same, for directories.
 
 It reads the **active Omarchy theme** at runtime
 (`~/.config/omarchy/current/theme/colors.toml`), so it always matches the rest
-of your TUIs and automatically re-colors when you switch themes.
+of your TUIs and re-colors when you switch themes.
 
 ## Features
 
-- **Live, debounced search** as you type (DuckDuckGo Instant Answer API — no
-  scraping, ToS-friendly).
-- **Inline preview**: heading, abstract/definition, source, and a scrollable
-  list of related topics.
-- **Browser hand-off**: `Enter` opens the selected topic, or the full
-  `duckduckgo.com` results page for your query, via `xdg-open`.
-- **Omarchy theming** at runtime, with a built-in fallback palette.
-- **Spotlight window** via a Hyprland float rule + keybind.
+- **Spotlight overlay**: a thin-bordered card that floats over the undimmed,
+  un-blurred desktop and **grows** as you type and search.
+- **Three modes via sigils** (`@` files, `/` folders, otherwise web), shown as a
+  mode icon in the search bar.
+- **Fast web suggestions** — a single reused HTTPS client (no per-keystroke TLS
+  setup) plus a short debounce.
+- **Ranked web links** inline — real titles, domains and snippets from the
+  DuckDuckGo HTML endpoint — alongside an **instant answer** block.
+- **Blazing-fast local search** — an in-memory index of `$HOME` (built once with
+  ripgrep's `ignore` walker, skipping hidden / `.gitignore`d / heavy dirs like
+  `node_modules`, `target`, `site-packages`, caches) fuzzy-matched on every
+  keystroke. ~90k entries index in ~0.1 s; filtering is then instant.
+- **Open anything**: `Enter` (or `1`–`9` for web links) opens the highlighted
+  result — web links in the browser, files/folders with `xdg-open`.
 
 ## Keys
 
-| Key            | Action                                              |
-|----------------|-----------------------------------------------------|
-| *(type)*       | Edit the query (live search after a short pause)    |
-| `↑` / `↓`      | Select a related topic                              |
-| `Enter`        | Open selected topic, or full DDG results, in browser|
-| `Ctrl-U`       | Clear the query                                     |
-| `Esc` / `Ctrl-C` | Quit                                              |
+| Key              | Action                                                       |
+|------------------|--------------------------------------------------------------|
+| *(type)*         | Edit the query. `@`/`/` at the start switch to file/folder mode |
+| `↑` / `↓`        | Move through suggestions / web links / local results         |
+| `Tab`            | Complete to the highlighted suggestion (web) / next result   |
+| `Enter`          | Search (web) · open the highlighted link / file / folder     |
+| `1`–`9`          | Open the matching **web** result directly                    |
+| `Esc`            | Close web results (back to typing), or quit                  |
+| `Ctrl-U`         | Clear the query                                              |
+| `Ctrl-C`         | Quit                                                         |
 
 ## Install
 
 Requires a Rust toolchain and `xdg-open` (both present on Omarchy).
 
 ```bash
-# from the project directory
 cargo build --release
 mkdir -p ~/.local/bin
 cp target/release/ddg-spotlight ~/.local/bin/
-
-# make sure ~/.local/bin is on your PATH (Omarchy default shells already do this)
 ```
 
-Quick sanity check without the TUI:
+Sanity checks without the TUI:
 
 ```bash
-~/.local/bin/ddg-spotlight --query "rust programming language"
+~/.local/bin/ddg-spotlight --query "rust programming language"   # web
+~/.local/bin/ddg-spotlight --files cargo                         # files
+~/.local/bin/ddg-spotlight --folders projects                    # folders
 ```
 
 ## Hyprland setup (the "Spotlight" part)
 
-The compact box is drawn by the app; the *floating, centered, dimmed* window is
-done with Hyprland rules. Copy the snippet from
+The card is drawn by the app; the floating, sharp, un-dimmed overlay is done
+with Hyprland rules + an Alacritty config. Copy the snippet from
 [`hypr-ddg-spotlight.conf`](./hypr-ddg-spotlight.conf):
 
 - the keybind line → `~/.config/hypr/bindings.conf`
-- the `windowrule` lines → `~/.config/hypr/looknfeel.conf`
+- the `windowrule` lines → `~/.config/hypr/looknfeel.conf` (or `hyprland.conf`)
 
-Then reload:
+How the look works:
+
+- The window is a full-screen float (`size 2560 1440`, `move 0 0`) with
+  **`no_blur on`** — so there's no Hyprland blur.
+- Alacritty `window.opacity = 0` makes the *default* background fully
+  transparent, so the desktop shows through the margins **undimmed and sharp**.
+  The card paints an explicit background (`≠` the default), so it stays opaque.
+  Want a slight dim behind the card? Raise `opacity` in
+  `~/.config/alacritty/ddg-spotlight.toml` — the card stays opaque regardless.
+
+Then reload Hyprland:
 
 ```bash
 hyprctl reload
 ```
 
-Now press **`Super + S`** anywhere to summon the search. (`Super + Shift + S` is
-already taken by screenshots on Omarchy, so this uses plain `Super + S` — change
-it in the snippet if you prefer another combo.)
-
-> The keybind launches `alacritty --class ddg-spotlight`, and the window rules
-> match `class:^(ddg-spotlight)$`. If you'd rather use Ghostty, swap the exec
-> line for `ghostty --class=ddg-spotlight -e ~/.local/bin/ddg-spotlight`.
+Press **`Super + S`** to summon the search. (`Super + Shift + S` is taken by
+screenshots on Omarchy, so this uses plain `Super + S`.)
 
 ## How it works
 
 ```
-main.rs    event loop, terminal raw-mode RAII guard, key handling, xdg-open
-app.rs     pure state: query, generation counter, selection, status
-search.rs  background worker thread + debounce (latest-wins via generation ids)
-ddg.rs     Instant Answer API client + JSON types + URL helpers
+main.rs    event loop, raw-mode RAII guard, mode-aware key handling, xdg-open
+app.rs     pure state: Mode + sigil parsing, query, suggestions, links, local results
+search.rs  background workers + debounce (web search, autocomplete, local search)
+ddg.rs     shared client + Instant Answer API + autocomplete + HTML link scraping
+local.rs   ignore-crate index of $HOME + SkimMatcherV2 fuzzy file/folder search
 theme.rs   parse Omarchy colors.toml -> ratatui colors (with fallback)
-ui.rs      compact centered "card" layout + rendering
+ui.rs      transparent-margin overlay + centered growing card + per-mode rendering
 ```
 
-Searches run on a worker thread; each query is tagged with an incrementing
-*generation* id so that responses from out-of-date keystrokes are discarded —
-you only ever see results for what's currently in the box.
+A web search runs two requests concurrently (`ddg::fetch_all`): the Instant
+Answer API for the abstract, and the no-JS HTML endpoint for the ranked links
+(redirect URLs are decoded; ads / internal links dropped). Local search builds
+the `$HOME` index lazily on the first `@`/`/` query, then filters it in memory.
+
+Every web/local request is tagged with an incrementing *generation* id so
+responses from out-of-date keystrokes are discarded.
 
 ## Notes / limitations
 
-- The DuckDuckGo Instant Answer API returns abstracts, definitions and related
-  topics, **not** a ranked list of web links. That's why full web results open
-  in the browser. Many queries (especially navigational ones) have no instant
-  answer — in that case the box just says so and `Enter` takes you to DDG.
-- Network/HTTP errors are shown inline in the status area.
+- The ranked web links come from scraping the DuckDuckGo **HTML** endpoint
+  (no API key). If links ever stop appearing, the selectors in
+  `ddg::parse_web_results` are the place to look.
+- The local index is rebuilt per launch (lazily, on the first local query). To
+  exclude more noise from local search, edit `DENY_DIRS` in `local.rs`.
+- Network/HTTP errors are shown inline in the web results panel.
