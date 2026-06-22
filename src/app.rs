@@ -60,6 +60,8 @@ pub enum Status {
 pub struct App {
     /// Current query text (including any leading mode sigil).
     pub query: String,
+    /// Caret position as a byte index into `query` (always on a char boundary).
+    pub cursor: usize,
     /// Generation counter; bumped on every query change.
     pub generation: u64,
     /// Current search mode (derived from the query sigil).
@@ -86,6 +88,7 @@ impl Default for App {
     fn default() -> Self {
         App {
             query: String::new(),
+            cursor: 0,
             generation: 0,
             mode: Mode::Web,
             result: SearchResult::default(),
@@ -110,31 +113,152 @@ impl App {
         parse_query(&self.query).1
     }
 
-    /// Insert a character at the end of the query and bump the generation.
+    /// Insert a character at the caret and advance the caret.
     pub fn push_char(&mut self, c: char) {
-        self.query.push(c);
+        self.query.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
         self.on_query_changed();
     }
 
-    /// Remove the last character of the query.
+    /// Delete the character before the caret (Backspace).
     pub fn backspace(&mut self) {
-        if self.query.pop().is_some() {
-            self.on_query_changed();
+        if self.cursor == 0 {
+            return;
         }
+        let start = self.prev_boundary(self.cursor);
+        self.query.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.on_query_changed();
+    }
+
+    /// Delete the character at the caret (Delete / forward-delete).
+    pub fn delete_forward(&mut self) {
+        if self.cursor >= self.query.len() {
+            return;
+        }
+        let end = self.next_boundary(self.cursor);
+        self.query.replace_range(self.cursor..end, "");
+        self.on_query_changed();
+    }
+
+    /// Delete the word before the caret (Ctrl-Backspace / Ctrl-W).
+    pub fn delete_word_back(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let head = &self.query[..self.cursor];
+        let trimmed = head.trim_end_matches(char::is_whitespace);
+        let start = trimmed.trim_end_matches(|c: char| !c.is_whitespace()).len();
+        self.query.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.on_query_changed();
     }
 
     /// Clear the entire query.
     pub fn clear_query(&mut self) {
         if !self.query.is_empty() {
             self.query.clear();
+            self.cursor = 0;
             self.on_query_changed();
         }
     }
 
-    /// Replace the query wholesale (e.g. after accepting a suggestion).
+    /// Replace the query wholesale (e.g. after accepting a suggestion); the
+    /// caret moves to the end.
     pub fn set_query(&mut self, query: String) {
         self.query = query;
+        self.cursor = self.query.len();
         self.on_query_changed();
+    }
+
+    /// Switch mode while preserving the typed term (adds/removes the sigil).
+    pub fn set_mode(&mut self, mode: Mode) {
+        let term = self.term().to_string();
+        self.query = match mode {
+            Mode::Web => term,
+            Mode::File => format!("@{term}"),
+            Mode::Folder => format!("/{term}"),
+        };
+        self.cursor = self.query.len();
+        self.on_query_changed();
+    }
+
+    // --- Caret movement (no query change, so no generation bump / re-search) ---
+
+    /// Move the caret one character left.
+    pub fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.prev_boundary(self.cursor);
+        }
+    }
+
+    /// Move the caret one character right.
+    pub fn move_right(&mut self) {
+        if self.cursor < self.query.len() {
+            self.cursor = self.next_boundary(self.cursor);
+        }
+    }
+
+    /// Move the caret to the start of the query.
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the caret to the end of the query.
+    pub fn move_end(&mut self) {
+        self.cursor = self.query.len();
+    }
+
+    /// Move the caret to the start of the previous word.
+    pub fn move_word_left(&mut self) {
+        let head = &self.query[..self.cursor];
+        let trimmed = head.trim_end_matches(char::is_whitespace);
+        self.cursor = trimmed.trim_end_matches(|c: char| !c.is_whitespace()).len();
+    }
+
+    /// Move the caret to the end of the next word.
+    pub fn move_word_right(&mut self) {
+        let tail = &self.query[self.cursor..];
+        let ws = tail.len() - tail.trim_start_matches(char::is_whitespace).len();
+        let rest = &tail[ws..];
+        let word = rest.len() - rest.trim_start_matches(|c: char| !c.is_whitespace()).len();
+        self.cursor += ws + word;
+    }
+
+    /// Byte index of the char boundary just before `i` (`i` must be > 0).
+    fn prev_boundary(&self, i: usize) -> usize {
+        self.query[..i]
+            .char_indices()
+            .next_back()
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    }
+
+    /// Byte index of the char boundary just after `i` (`i` must be < len).
+    fn next_boundary(&self, i: usize) -> usize {
+        self.query[i..]
+            .chars()
+            .next()
+            .map(|c| i + c.len_utf8())
+            .unwrap_or(i)
+    }
+
+    /// Caret column within the displayed (sigil-stripped) term, in characters.
+    /// Used to position the block cursor in the search field.
+    pub fn caret_col(&self) -> usize {
+        let (_, term) = parse_query(&self.query);
+        let term_start = self.query.len() - term.len();
+        let c = self.cursor.clamp(term_start, self.query.len());
+        self.query[term_start..c].chars().count()
+    }
+
+    /// Set the selected list index (used by mouse clicks), clamped to the list.
+    pub fn select(&mut self, idx: usize) {
+        let len = self.active_len();
+        if len == 0 {
+            return;
+        }
+        self.selected = Some(idx.min(len - 1));
     }
 
     fn on_query_changed(&mut self) {
@@ -514,5 +638,99 @@ mod tests {
         assert!(!app.results_visible);
         assert_eq!(app.selected, None);
         assert_eq!(app.query, "r");
+    }
+
+    #[test]
+    fn caret_insert_in_middle() {
+        let mut app = App::new();
+        for c in "rust".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.cursor, 4);
+        app.move_left();
+        app.move_left();
+        assert_eq!(app.cursor, 2);
+        app.push_char('X'); // "ruXst"
+        assert_eq!(app.query, "ruXst");
+        assert_eq!(app.cursor, 3);
+        app.move_home();
+        assert_eq!(app.cursor, 0);
+        app.move_end();
+        assert_eq!(app.cursor, app.query.len());
+    }
+
+    #[test]
+    fn delete_forward_removes_char_at_caret() {
+        let mut app = App::new();
+        for c in "abc".chars() {
+            app.push_char(c);
+        }
+        app.move_home();
+        app.delete_forward(); // removes 'a'
+        assert_eq!(app.query, "bc");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn delete_word_back_removes_previous_word() {
+        let mut app = App::new();
+        for c in "rust async".chars() {
+            app.push_char(c);
+        }
+        app.delete_word_back();
+        assert_eq!(app.query, "rust ");
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[test]
+    fn word_movement() {
+        let mut app = App::new();
+        for c in "foo bar".chars() {
+            app.push_char(c);
+        }
+        app.move_word_left(); // start of "bar"
+        assert_eq!(app.cursor, 4);
+        app.move_word_left(); // start of "foo"
+        assert_eq!(app.cursor, 0);
+        app.move_word_right(); // end of "foo"
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn caret_col_accounts_for_sigil() {
+        let mut app = App::new();
+        for c in "@doc".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.caret_col(), 3); // after "doc"
+        app.move_home(); // before the '@'
+        assert_eq!(app.caret_col(), 0); // clamped to term start
+    }
+
+    #[test]
+    fn set_mode_preserves_term() {
+        let mut app = App::new();
+        for c in "notes".chars() {
+            app.push_char(c);
+        }
+        app.set_mode(Mode::File);
+        assert_eq!(app.query, "@notes");
+        assert_eq!(app.mode, Mode::File);
+        assert_eq!(app.term(), "notes");
+        assert_eq!(app.cursor, app.query.len());
+        app.set_mode(Mode::Web);
+        assert_eq!(app.query, "notes");
+        assert_eq!(app.mode, Mode::Web);
+    }
+
+    #[test]
+    fn select_clamps_to_list() {
+        let mut app = App::new();
+        app.push_char('a');
+        app.apply_outcome(app.generation, Ok(result_with_links(3)));
+        app.select(2);
+        assert_eq!(app.selected, Some(2));
+        app.select(99);
+        assert_eq!(app.selected, Some(2));
     }
 }

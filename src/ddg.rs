@@ -56,6 +56,10 @@ pub struct SearchResult {
     pub related: Vec<Topic>,
     /// Ranked web result links (Google-style) from the HTML endpoint.
     pub links: Vec<WebLink>,
+    /// True when `answer_text` is DuckDuckGo's direct `Answer` (e.g. a
+    /// calculation/conversion) rather than an abstract/definition. Direct
+    /// answers are never replaced by the featured-snippet fallback.
+    pub answer_is_direct: bool,
 }
 
 impl SearchResult {
@@ -113,7 +117,8 @@ pub fn parse_response(body: &str) -> Result<SearchResult, serde_json::Error> {
 
 fn normalize(raw: RawResponse) -> SearchResult {
     // Prefer an explicit Answer, then Abstract, then Definition.
-    let (answer_text, source, answer_url) = if !raw.Answer.is_empty() {
+    let answer_is_direct = !raw.Answer.is_empty();
+    let (answer_text, source, answer_url) = if answer_is_direct {
         (raw.Answer, raw.AbstractSource, raw.AbstractURL)
     } else if !raw.AbstractText.is_empty() {
         (raw.AbstractText, raw.AbstractSource, raw.AbstractURL)
@@ -133,6 +138,7 @@ fn normalize(raw: RawResponse) -> SearchResult {
         answer_url,
         related,
         links: Vec::new(),
+        answer_is_direct,
     }
 }
 
@@ -367,10 +373,54 @@ pub fn fetch_web(client: &Client, query: &str) -> Result<Vec<WebLink>, String> {
     Ok(parse_web_results(&body))
 }
 
+/// Heuristic: does this query ask for a *specific* fact — who/where/when/which
+/// or a "how many/much/…" quantity — where DuckDuckGo's topic abstract tends to
+/// be the wrong granularity (it describes the office/topic) or is simply empty?
+/// Such queries are answered far better by the top web result's snippet.
+///
+/// Definitional "what is …" and open "why/how …" queries are intentionally
+/// excluded: the Instant Answer abstract/definition is good for those.
+fn is_factoid_question(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    const LEADERS: &[&str] = &[
+        "who ", "whom ", "whose ", "where ", "when ", "which ",
+    ];
+    if LEADERS.iter().any(|p| q.starts_with(p)) {
+        return true;
+    }
+    const QUANTITIES: &[&str] = &[
+        "how many ",
+        "how much ",
+        "how old ",
+        "how tall ",
+        "how far ",
+        "how long ",
+        "how high ",
+        "how deep ",
+    ];
+    QUANTITIES.iter().any(|p| q.starts_with(p))
+}
+
+/// For factoid questions without a direct DuckDuckGo answer, promote the top web
+/// result (title + snippet + domain) into the answer block — a featured-snippet
+/// style answer, since the topic abstract is usually generic or missing here.
+fn apply_featured_answer(result: &mut SearchResult, query: &str) {
+    if result.answer_is_direct || !is_factoid_question(query) {
+        return;
+    }
+    if let Some(link) = result.links.iter().find(|l| !l.snippet.is_empty()) {
+        result.heading = link.title.clone();
+        result.answer_text = link.snippet.clone();
+        result.source = link.domain.clone();
+        result.answer_url = link.url.clone();
+    }
+}
+
 /// Fetch both the Instant Answer (definition/abstract) and the ranked web links
 /// for a query, merging them into a single [`SearchResult`]. The two network
 /// calls run concurrently (sharing the connection pool). Returns an error only
-/// if *both* fail.
+/// if *both* fail. For factoid questions the top web result is promoted into the
+/// answer block (see [`apply_featured_answer`]).
 pub fn fetch_all(client: &Client, query: &str) -> Result<SearchResult, String> {
     let web_client = client.clone();
     let q_web = query.to_string();
@@ -380,18 +430,20 @@ pub fn fetch_all(client: &Client, query: &str) -> Result<SearchResult, String> {
         .join()
         .unwrap_or_else(|_| Err("web worker panicked".to_string()));
 
-    match (answer, web) {
+    let mut result = match (answer, web) {
         (Ok(mut result), Ok(links)) => {
             result.links = links;
-            Ok(result)
+            result
         }
-        (Ok(result), Err(_)) => Ok(result),
-        (Err(_), Ok(links)) => Ok(SearchResult {
+        (Ok(result), Err(_)) => result,
+        (Err(_), Ok(links)) => SearchResult {
             links,
             ..Default::default()
-        }),
-        (Err(answer_err), Err(web_err)) => Err(format!("{web_err} / {answer_err}")),
-    }
+        },
+        (Err(answer_err), Err(web_err)) => return Err(format!("{web_err} / {answer_err}")),
+    };
+    apply_featured_answer(&mut result, query);
+    Ok(result)
 }
 
 /// Fetch autocomplete suggestions from DuckDuckGo.
@@ -446,6 +498,77 @@ mod tests {
         }"#;
         let r = parse_response(json).unwrap();
         assert_eq!(r.answer_text, "42");
+        assert!(r.answer_is_direct);
+    }
+
+    #[test]
+    fn detects_factoid_questions() {
+        assert!(is_factoid_question("who is pm of india"));
+        assert!(is_factoid_question("Where is the Eiffel Tower"));
+        assert!(is_factoid_question("how many feet in a mile"));
+        assert!(is_factoid_question("Which planet is the largest"));
+        // Definitional / open questions keep the Instant Answer abstract.
+        assert!(!is_factoid_question("what is photosynthesis"));
+        assert!(!is_factoid_question("rust programming language"));
+        assert!(!is_factoid_question("how to write a for loop"));
+        assert!(!is_factoid_question("why is the sky blue"));
+    }
+
+    fn link(snippet: &str) -> WebLink {
+        WebLink {
+            title: "Top Result".into(),
+            url: "https://top.example/x".into(),
+            snippet: snippet.into(),
+            domain: "top.example".into(),
+        }
+    }
+
+    #[test]
+    fn featured_answer_promotes_top_snippet_for_factoids() {
+        let mut r = SearchResult {
+            heading: "Prime Minister of India".into(),
+            answer_text: "The prime minister of India is the head of government.".into(),
+            source: "Wikipedia".into(),
+            links: vec![link("Narendra Modi was sworn in as PM in 2024.")],
+            ..Default::default()
+        };
+        apply_featured_answer(&mut r, "who is pm of india");
+        assert_eq!(r.answer_text, "Narendra Modi was sworn in as PM in 2024.");
+        assert_eq!(r.source, "top.example");
+        assert_eq!(r.heading, "Top Result");
+    }
+
+    #[test]
+    fn featured_answer_used_when_abstract_empty() {
+        let mut r = SearchResult {
+            links: vec![link("Elon Musk is the CEO of Tesla.")],
+            ..Default::default()
+        };
+        apply_featured_answer(&mut r, "who is the ceo of tesla");
+        assert_eq!(r.answer_text, "Elon Musk is the CEO of Tesla.");
+    }
+
+    #[test]
+    fn featured_answer_keeps_direct_answer() {
+        let mut r = SearchResult {
+            answer_text: "5280 feet".into(),
+            answer_is_direct: true,
+            links: vec![link("A mile is a unit of length.")],
+            ..Default::default()
+        };
+        apply_featured_answer(&mut r, "how many feet in a mile");
+        assert_eq!(r.answer_text, "5280 feet"); // not clobbered
+    }
+
+    #[test]
+    fn featured_answer_skips_non_factoid() {
+        let mut r = SearchResult {
+            answer_text: "Rust is a programming language.".into(),
+            links: vec![link("something else")],
+            ..Default::default()
+        };
+        apply_featured_answer(&mut r, "rust programming language");
+        assert_eq!(r.answer_text, "Rust is a programming language."); // unchanged
     }
 
     #[test]

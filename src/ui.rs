@@ -39,6 +39,66 @@ const ICON_COLS: u16 = 3;
 /// Width of the "Web | Files | Folder" tab indicator.
 const MODE_TABS_WIDTH: u16 = 20;
 
+/// Which on-screen result list a click landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitKind {
+    Link,
+    Local,
+    Suggestion,
+}
+
+/// A clickable result list's on-screen geometry, for mouse hit-testing.
+#[derive(Debug, Clone)]
+pub struct ListHits {
+    pub kind: HitKind,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    /// Rows per item (1 for local/suggestions, 2 for web links).
+    pub row_height: u16,
+    pub count: usize,
+    /// Index of the top visible item (the list's scroll offset).
+    pub first_index: usize,
+}
+
+/// Clickable regions produced by one render pass, used to route mouse events.
+#[derive(Debug, Clone, Default)]
+pub struct ClickMap {
+    pub list: Option<ListHits>,
+    /// Row the mode tabs are drawn on (the search input row).
+    pub tabs_row: Option<u16>,
+    /// `(x_start_inclusive, x_end_exclusive, mode)` for each mode tab.
+    pub tabs: Vec<(u16, u16, Mode)>,
+}
+
+impl ClickMap {
+    /// Map a click position to a `(list kind, item index)` if it lands on a row.
+    pub fn list_hit(&self, col: u16, row: u16) -> Option<(HitKind, usize)> {
+        let l = self.list.as_ref()?;
+        if row < l.y || row >= l.y.saturating_add(l.height) {
+            return None;
+        }
+        if col < l.x || col >= l.x.saturating_add(l.width) {
+            return None;
+        }
+        let slot = ((row - l.y) / l.row_height) as usize;
+        let idx = l.first_index + slot;
+        (idx < l.count).then_some((l.kind, idx))
+    }
+
+    /// Map a click position to a mode if it lands on a mode tab.
+    pub fn tab_hit(&self, col: u16, row: u16) -> Option<Mode> {
+        if self.tabs_row != Some(row) {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .find(|(x0, x1, _)| col >= *x0 && col < *x1)
+            .map(|&(_, _, m)| m)
+    }
+}
+
 /// Compute the card width for a given screen width.
 pub fn card_width(screen_w: u16) -> u16 {
     let target = screen_w.saturating_mul(WIDTH_NUM) / WIDTH_DEN;
@@ -114,21 +174,21 @@ pub fn compute_card_rect(area: Rect, app: &App) -> Rect {
     }
 }
 
-pub fn render(f: &mut Frame, app: &App, theme: &Theme) {
+pub fn render(f: &mut Frame, app: &App, theme: &Theme) -> ClickMap {
     let area = f.area();
     // Transparent margins: clear everything to the terminal default (Reset) bg.
     f.render_widget(Clear, area);
 
     if area.width < 12 || area.height < 5 {
         render_search_field(f, Rect { height: 1, ..area }, app, theme);
-        return;
+        return ClickMap::default();
     }
 
     let card = compute_card_rect(area, app);
-    render_card(f, card, app, theme);
+    render_card(f, card, app, theme)
 }
 
-fn render_card(f: &mut Frame, card: Rect, app: &App, theme: &Theme) {
+fn render_card(f: &mut Frame, card: Rect, app: &App, theme: &Theme) -> ClickMap {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Plain)
@@ -145,17 +205,22 @@ fn render_card(f: &mut Frame, card: Rect, app: &App, theme: &Theme) {
         height: inner.height,
     };
     if content.width == 0 || content.height == 0 {
-        return;
+        return ClickMap::default();
     }
+
+    let mut map = ClickMap::default();
 
     let input_area = Rect {
         height: 1,
         ..content
     };
-    render_search_field(f, input_area, app, theme);
+    map.tabs = render_search_field(f, input_area, app, theme);
+    if !map.tabs.is_empty() {
+        map.tabs_row = Some(input_area.y);
+    }
 
     if content.height <= 1 {
-        return;
+        return map;
     }
     let rest = Rect {
         y: content.y + 1,
@@ -164,9 +229,9 @@ fn render_card(f: &mut Frame, card: Rect, app: &App, theme: &Theme) {
     };
 
     if app.mode.is_local() {
-        render_local(f, rest, app, theme);
+        map.list = render_local(f, rest, app, theme);
     } else if app.results_visible {
-        render_results(f, rest, app, theme);
+        map.list = render_results(f, rest, app, theme);
     } else if app.status == Status::Searching {
         let muted = Style::default()
             .fg(theme.muted)
@@ -176,8 +241,9 @@ fn render_card(f: &mut Frame, card: Rect, app: &App, theme: &Theme) {
             rest,
         );
     } else if !app.suggestions.is_empty() {
-        render_suggestions(f, rest, app, theme);
+        map.list = render_suggestions(f, rest, app, theme);
     }
+    map
 }
 
 /// Glyph for the current mode.
@@ -198,7 +264,12 @@ fn placeholder(mode: Mode) -> &'static str {
     }
 }
 
-fn render_search_field(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn render_search_field(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+) -> Vec<(u16, u16, Mode)> {
     use ratatui::layout::Alignment;
     let accent = Style::default().fg(theme.accent);
     let muted = Style::default().fg(theme.muted);
@@ -208,9 +279,11 @@ fn render_search_field(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     // Right-aligned mode indicator: Web | Files | Folder (active highlighted).
     let tabs_w = MODE_TABS_WIDTH.min(area.width);
+    let mut tab_hits = Vec::new();
     if tabs_w > 0 {
+        let tabs_x = area.x + area.width - tabs_w;
         let tabs_area = Rect {
-            x: area.x + area.width - tabs_w,
+            x: tabs_x,
             y: area.y,
             width: tabs_w,
             height: 1,
@@ -219,6 +292,15 @@ fn render_search_field(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Paragraph::new(mode_tabs(app.mode, theme)).alignment(Alignment::Right),
             tabs_area,
         );
+        // Click regions, only when the full-width tabs are shown (so the offsets
+        // below — "Web | Files | Folder" — line up exactly).
+        if tabs_w == MODE_TABS_WIDTH {
+            tab_hits = vec![
+                (tabs_x, tabs_x + 3, Mode::Web),
+                (tabs_x + 6, tabs_x + 11, Mode::File),
+                (tabs_x + 14, tabs_x + 20, Mode::Folder),
+            ];
+        }
     }
 
     // Left input: the mode icon + the (sigil-stripped) term, leaving room for
@@ -240,11 +322,13 @@ fn render_search_field(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     };
     f.render_widget(Paragraph::new(line), input_area);
 
-    // Real terminal cursor (a blinking block, set in `Tui::new`) at the caret:
-    // on the first placeholder letter when empty, else just after the term.
-    let caret = ICON_COLS + term.chars().count() as u16;
+    // Real terminal cursor (a blinking block, set in `Tui::new`) at the caret
+    // position, tracking arrow-key movement within the term.
+    let caret = ICON_COLS + app.caret_col() as u16;
     let cx = area.x + caret.min(input_w.saturating_sub(1));
     f.set_cursor_position((cx, area.y));
+
+    tab_hits
 }
 
 /// The right-aligned mode indicator: `Web | Files | Folder`, active highlighted.
@@ -272,7 +356,7 @@ fn selection_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-fn render_suggestions(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn render_suggestions(f: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Option<ListHits> {
     let base = Style::default().fg(theme.foreground);
     let items: Vec<ListItem> = app
         .suggestions
@@ -292,12 +376,23 @@ fn render_suggestions(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let mut state = ListState::default();
     state.select(app.suggestion_selected);
     f.render_stateful_widget(list, area, &mut state);
+
+    Some(ListHits {
+        kind: HitKind::Suggestion,
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+        row_height: 1,
+        count: app.suggestions.len(),
+        first_index: state.offset(),
+    })
 }
 
 /// Render the local file/folder results (or a status line) + footer.
-fn render_local(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn render_local(f: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Option<ListHits> {
     if area.height == 0 {
-        return;
+        return None;
     }
     let muted = Style::default().fg(theme.muted);
     let bold = Style::default()
@@ -321,7 +416,7 @@ fn render_local(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ..area
     };
     if body.height == 0 {
-        return;
+        return None;
     }
 
     if app.local_results.is_empty() {
@@ -339,7 +434,7 @@ fn render_local(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ))),
             body,
         );
-        return;
+        return None;
     }
 
     let width = body.width as usize;
@@ -366,11 +461,22 @@ fn render_local(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let mut state = ListState::default();
     state.select(app.selected);
     f.render_stateful_widget(list, body, &mut state);
+
+    Some(ListHits {
+        kind: HitKind::Local,
+        x: body.x,
+        y: body.y,
+        width: body.width,
+        height: body.height,
+        row_height: 1,
+        count: app.local_results.len(),
+        first_index: state.offset(),
+    })
 }
 
-fn render_results(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn render_results(f: &mut Frame, area: Rect, app: &App, theme: &Theme) -> Option<ListHits> {
     if area.height == 0 {
-        return;
+        return None;
     }
     let muted = Style::default().fg(theme.muted);
     let error = Style::default().fg(theme.error);
@@ -392,7 +498,7 @@ fn render_results(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ..area
     };
     if body.height == 0 {
-        return;
+        return None;
     }
 
     if let Status::Error(e) = &app.status {
@@ -400,7 +506,7 @@ fn render_results(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Paragraph::new(Line::from(Span::styled(format!("error: {e}"), error))),
             body,
         );
-        return;
+        return None;
     }
 
     let answer_lines = build_answer_lines(&app.result, theme, body.width as usize);
@@ -416,7 +522,7 @@ fn render_results(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ..body
     };
     if links_area.height == 0 {
-        return;
+        return None;
     }
 
     if app.result.links.is_empty() {
@@ -429,7 +535,7 @@ fn render_results(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                 links_area,
             );
         }
-        return;
+        return None;
     }
 
     let items = build_link_items(app, theme, links_area.width as usize);
@@ -439,6 +545,17 @@ fn render_results(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let mut state = ListState::default();
     state.select(app.selected);
     f.render_stateful_widget(list, links_area, &mut state);
+
+    Some(ListHits {
+        kind: HitKind::Link,
+        x: links_area.x,
+        y: links_area.y,
+        width: links_area.width,
+        height: links_area.height,
+        row_height: 2,
+        count: app.result.links.len(),
+        first_index: state.offset(),
+    })
 }
 
 /// Build the answer-block lines (heading, wrapped abstract, source, spacer).
@@ -715,5 +832,67 @@ mod tests {
         assert_eq!(line.spans[0].content, "Web");
         assert_eq!(line.spans[2].content, "Files");
         assert_eq!(line.spans[4].content, "Folder");
+    }
+
+    #[test]
+    fn click_map_list_hit_maps_rows() {
+        // Web links: 2 rows per item.
+        let map = ClickMap {
+            list: Some(ListHits {
+                kind: HitKind::Link,
+                x: 5,
+                y: 10,
+                width: 40,
+                height: 6,
+                row_height: 2,
+                count: 3,
+                first_index: 0,
+            }),
+            tabs_row: None,
+            tabs: vec![],
+        };
+        assert_eq!(map.list_hit(6, 10), Some((HitKind::Link, 0)));
+        assert_eq!(map.list_hit(6, 13), Some((HitKind::Link, 1)));
+        assert_eq!(map.list_hit(6, 15), Some((HitKind::Link, 2)));
+        assert_eq!(map.list_hit(4, 10), None); // left of the list
+        assert_eq!(map.list_hit(45, 10), None); // right of the list
+        assert_eq!(map.list_hit(6, 16), None); // below the list
+    }
+
+    #[test]
+    fn click_map_list_hit_respects_scroll_offset() {
+        let map = ClickMap {
+            list: Some(ListHits {
+                kind: HitKind::Local,
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 3,
+                row_height: 1,
+                count: 50,
+                first_index: 10,
+            }),
+            tabs_row: None,
+            tabs: vec![],
+        };
+        assert_eq!(map.list_hit(1, 0), Some((HitKind::Local, 10)));
+        assert_eq!(map.list_hit(1, 2), Some((HitKind::Local, 12)));
+    }
+
+    #[test]
+    fn click_map_tab_hit() {
+        let map = ClickMap {
+            list: None,
+            tabs_row: Some(3),
+            tabs: vec![
+                (10, 13, Mode::Web),
+                (16, 21, Mode::File),
+                (24, 30, Mode::Folder),
+            ],
+        };
+        assert_eq!(map.tab_hit(11, 3), Some(Mode::Web));
+        assert_eq!(map.tab_hit(17, 3), Some(Mode::File));
+        assert_eq!(map.tab_hit(13, 3), None); // in the separator gap
+        assert_eq!(map.tab_hit(11, 4), None); // wrong row
     }
 }

@@ -4,7 +4,7 @@
 
 ```
 cargo build --release            # optimized build (opt-level=z, lto, stripped)
-cargo test                       # all unit tests (61)
+cargo test                       # all unit tests (73)
 cargo clippy --all-targets       # lints
 ddg-spotlight --query "rust"     # CLI debug: web answer + links, no TUI
 ddg-spotlight --files cargo      # CLI debug: local file search, no TUI
@@ -20,13 +20,13 @@ Single binary crate — 7 source files, each purpose-specific:
 
 | File | Role |
 |------|------|
-| `main.rs` | crossterm event loop, `Tui` RAII guard, mode-aware key dispatch, `xdg_open` |
-| `app.rs` | Pure state + transitions: `Mode` (Web/Folder/File), sigil parsing, web + local results |
+| `main.rs` | crossterm event loop, `Tui` RAII guard, mode-aware key dispatch (incl. caret editing), mouse routing (`handle_mouse`), detached `xdg_open` |
+| `app.rs` | Pure state + transitions: `Mode` (Web/Folder/File), sigil parsing, text caret (`cursor`/`caret_col`), web + local results |
 | `search.rs` | Background workers: `SearchWorker` (web `fetch_all`) + `SuggestionWorker` (autocomplete) + `LocalSearchWorker` (file/folder) + debouncer |
 | `ddg.rs` | Shared `Client` + Instant Answer API + autocomplete (`/ac/`) + HTML link scraping (`scraper`) + `fetch_all` |
 | `local.rs` | `ignore`-crate index of `$HOME` + `SkimMatcherV2` fuzzy search (File/Folder modes) |
 | `theme.rs` | Parse `~/.config/omarchy/current/theme/colors.toml` → ratatui colors |
-| `ui.rs` | Transparent-margin overlay + centered growing card (per-mode: suggestions / answer+links / local results) |
+| `ui.rs` | Transparent-margin overlay + centered growing card; `render` returns a `ClickMap` (result-row + mode-tab hit regions) for the mouse |
 
 ## Modes (leading sigil)
 
@@ -43,6 +43,13 @@ Single binary crate — 7 source files, each purpose-specific:
   mode: web → `SuggestionWorker`; local → `LocalSearchWorker`.
 - **Up/Down/Tab** navigate the active list (web suggestions, web links, or local
   results); **Enter** searches (web) or opens (local / selected web link).
+- **Caret editing** in the input: `←`/`→` (word with `Ctrl`), `Home`/`End`
+  (`Ctrl-A`/`Ctrl-E`), `Backspace`/`Delete`, `Ctrl-Backspace`/`Ctrl-W` (word).
+  State is a byte-index `App::cursor`; `App::caret_col()` maps it to the drawn
+  column. Caret moves don't bump the generation (no re-search).
+- **Mouse**: left-click a result row opens it / a mode tab switches mode; the
+  wheel moves the selection. `handle_mouse` uses the `ClickMap` returned by
+  `ui::render`. Shift-drag bypasses mouse capture for native selection + copy.
 - Generation ids tag every web/local request so stale responses are discarded.
 
 ## Gotchas
@@ -54,8 +61,28 @@ Single binary crate — 7 source files, each purpose-specific:
 - **Local index = `ignore::WalkBuilder` (parallel) over `$HOME`.** Skips hidden + `.gitignore`d files and a `DENY_DIRS` denylist (node_modules, target, dist, build, venv, __pycache__, vendor, .git, .cache, site-packages). `max_depth 14`, `MAX_INDEX 200k`. Built **lazily on the first local query** in `LocalSearchWorker`, then filtered in-memory (instant). To prune more noise, edit `DENY_DIRS`.
 - **Fuzzy ranking** = `SkimMatcherV2` on the entry *name*, sorted by score → shallower `path_depth` → shorter name.
 - **`fetch_all` only errors if *both* requests fail.** Missing answer still yields links and vice-versa.
+- **Factoid questions get a featured answer.** `is_factoid_question` (who/where/when/which + how many/much/old…) makes `fetch_all` promote the top web result's snippet into the answer block, because DuckDuckGo's abstract describes the *topic/office*, not the fact (or is empty). Direct `Answer`s (`answer_is_direct`) and "what is" definitions are kept. Tune the trigger words there.
 - **Release profile strips + size-optimizes.** `opt-level="z"`, `lto=true`, `strip=true`. ~5M with `scraper` + `ignore`.
 - **`Tui` is a RAII guard** (raw mode + alt screen in `new`, restored in `Drop`).
+- **Mouse is captured** (`EnableMouseCapture`) so plain drags don't paint a
+  terminal selection over the transparent margins; clicks/scroll go to the app.
+  Hold **Shift** to bypass capture for a native selection (auto-copied —
+  `selection.save_to_clipboard` in the Alacritty config). The cursor is a real
+  blinking **block** (`SetCursorStyle::BlinkingBlock`), positioned each frame via
+  `Frame::set_cursor_position` at `App::caret_col()`.
+- **`xdg_open` must be detached.** It sets `process_group(0)` + null stdio so the
+  SIGHUP fired when this window closes (right after `should_quit`) doesn't kill
+  the browser/file-manager before it launches. Without this, "Enter opens
+  nothing" — the classic launcher bug.
+- **Kitty keyboard protocol** (`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`,
+  if `supports_keyboard_enhancement()`) is what makes **Ctrl-Backspace**
+  distinguishable from plain Backspace. `Ctrl-W` is the always-works fallback.
+- **Mouse hit-testing assumes top-of-list = item 0 + the list's scroll offset.**
+  Each list renderer returns a `ListHits` carrying `first_index = state.offset()`
+  (read right after `render_stateful_widget`, since a fresh `ListState` recomputes
+  the offset deterministically from `selected` each frame). `row_height` is 2 for
+  web links, 1 for local/suggestions. Mode-tab x-ranges are only recorded when the
+  full-width (`MODE_TABS_WIDTH`) tabs are drawn.
 - **Workers have testable constructors** (`spawn_with`). Tests pass fake fetch fns.
 - **Theme file is optional**; `Theme::load()` falls back to a built-in palette.
 
