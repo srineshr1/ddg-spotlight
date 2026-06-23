@@ -1,6 +1,8 @@
 # ddg-spotlight
 
-![ddg-spotlight demo](search.gif)
+<p align="center">
+  <img src="search.gif" alt="ddg-spotlight demo" style="border: 2px solid #565f89; border-radius: 8px;">
+</p>
 
 A macOS-Spotlight-style **search launcher for the terminal**, built for
 Omarchy / Hyprland. Hit a keybind and a small bordered search bar appears,
