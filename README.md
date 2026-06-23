@@ -1,5 +1,7 @@
 # ddg-spotlight
 
+![ddg-spotlight demo](search.gif)
+
 A macOS-Spotlight-style **search launcher for the terminal**, built for
 Omarchy / Hyprland. Hit a keybind and a small bordered search bar appears,
 floating over your normal (un-dimmed, un-blurred) desktop. It has **three modes**,
@@ -66,7 +68,26 @@ of your TUIs and re-colors when you switch themes.
 
 ## Install
 
-Requires a Rust toolchain and `xdg-open` (both present on Omarchy).
+Requires `xdg-open` (present on any modern Linux).
+
+### Via crates.io
+
+```bash
+cargo install ddg-spotlight
+```
+
+### Via GitHub Releases (precompiled binary)
+
+Download the latest `ddg-spotlight` binary from
+[Releases](https://github.com/srineshr1/search/releases) and place it on your
+`$PATH`:
+
+```bash
+chmod +x ddg-spotlight
+mv ddg-spotlight ~/.local/bin/
+```
+
+### Build from source
 
 ```bash
 cargo build --release
